@@ -83,44 +83,140 @@ def _squared_distance(a, b):
         + ((a["total_receipts_amount"] - b["total_receipts_amount"]) * SCALE_RECEIPTS) ** 2
     )
 
+# Ridge-regression model (global, avoids over-fitting public set)
+LAMBDA_RIDGE = 5e-3  # slightly stronger regularisation for even larger feature set
+
+import math
+
+# Helper to capture piecewise penalties/bonuses hinted in interviews
+def _features(days: float, miles: float, receipts: float):
+    if days <= 0:
+        days = 1e-6  # guard
+    rec_per_day = receipts / days
+    miles_per_day = miles / days
+
+    # Penalty buckets
+    high_receipt_pen = max(0.0, rec_per_day - 200.0)
+    low_receipt_pen = max(0.0, 20.0 - rec_per_day)
+
+    # Non-linear transforms
+    log_r = math.log1p(receipts)
+
+    total_receipts_large = max(0.0, receipts - 1500.0)
+    return [
+        1.0,
+        days,
+        miles,
+        receipts,
+        days * days,
+        miles * miles,
+        receipts * receipts,
+        days * miles,
+        days * receipts,
+        miles * receipts,
+        rec_per_day,
+        rec_per_day * rec_per_day,
+        miles_per_day,
+        miles_per_day * miles_per_day,
+        log_r,
+        log_r * log_r,
+        high_receipt_pen,
+        low_receipt_pen,
+        high_receipt_pen * high_receipt_pen,
+        total_receipts_large,
+        total_receipts_large * total_receipts_large,
+        high_receipt_pen * miles_per_day,
+    ]
+
+_BETA = []  # learned coefficients (length auto-detected)
+
+def _train_ridge():
+    """Fit ridge regression on the public sample and populate _BETA."""
+    global _BETA
+
+    dim = len(_features(1.0, 1.0, 1.0))
+    XtX = [[0.0] * dim for _ in range(dim)]
+    Xty = [0.0] * dim
+
+    for case in _RAW_DATA:
+        d = case["input"]["trip_duration_days"]
+        m = case["input"]["miles_traveled"]
+        r = case["input"]["total_receipts_amount"]
+        y = case["expected_output"]
+        feats = _features(d, m, r)
+        for i in range(dim):
+            Xty[i] += feats[i] * y
+            for j in range(dim):
+                XtX[i][j] += feats[i] * feats[j]
+
+    # L2 regularisation
+    for i in range(dim):
+        XtX[i][i] += LAMBDA_RIDGE
+
+    # Invert XtX via Gauss-Jordan (dim is small – 10 × 10)
+    A = [row[:] for row in XtX]
+    for i in range(dim):
+        A[i] += [1.0 if i == j else 0.0 for j in range(dim)]
+
+    for i in range(dim):
+        pivot = A[i][i] or 1e-12
+        inv_pivot = 1.0 / pivot
+        for j in range(2 * dim):
+            A[i][j] *= inv_pivot
+        for k in range(dim):
+            if k == i:
+                continue
+            factor = A[k][i]
+            for j in range(2 * dim):
+                A[k][j] -= factor * A[i][j]
+
+    inv = [row[dim:] for row in A]
+    _BETA = [sum(inv[i][j] * Xty[j] for j in range(dim)) for i in range(dim)]
+
+_train_ridge()
+
+# Build residual set relative to ridge baseline for kNN smoothing
+_RIDGE_RES_LIST = []  # list of (input_dict, residual)
+for _c in _RAW_DATA:
+    d = _c["input"]["trip_duration_days"]
+    m = _c["input"]["miles_traveled"]
+    r = _c["input"]["total_receipts_amount"]
+    baseline = sum(b * f for b, f in zip(_BETA, _features(d, m, r)))
+    residual = _c["expected_output"] - baseline
+    _RIDGE_RES_LIST.append((_c["input"], residual))
+
+# kNN residual hyper-params
+# residual kNN weighting dynamically determined
+# Function will interpolate 0.3 (low receipts) to 0.8 (very high receipts)
+# Increase k to 9 for smoother residual estimate
+RES_K = 9
+
+def _alpha(receipts: float) -> float:
+    """Return weight for residual adjustment based on receipts.
+    Low receipts use ~0.3 weight, high receipts (~2000) use ~0.8."""
+    return 0.3 + 0.5 / (1.0 + math.exp(-(receipts - 1200.0) / 400.0))
+
 # Public API
 def predict(trip_duration_days: float, miles_traveled: float, total_receipts_amount: float) -> float:
     """Return a reimbursement prediction rounded to 2 decimals."""
-    query = {
-        "trip_duration_days": float(trip_duration_days),
-        "miles_traveled": float(miles_traveled),
-        "total_receipts_amount": float(total_receipts_amount),
-    }
+    # Ridge model prediction – smoother and less likely to over-fit
+    days = float(trip_duration_days)
+    miles = float(miles_traveled)
+    receipts = float(total_receipts_amount)
 
-    # 1) Baseline via per-day linear model (or nearest smaller day if unseen)
-    day = int(round(query["trip_duration_days"]))
-    if day not in _DAY_BETAS:
-        # fallback to closest existing day
-        nearest_day = min(_DAY_BETAS.keys(), key=lambda d: abs(d - day))
-        beta = _DAY_BETAS[nearest_day]
-    else:
-        beta = _DAY_BETAS[day]
+    ridge_val = sum(b * f for b, f in zip(_BETA, _features(days, miles, receipts)))
 
-    baseline = beta[0] + beta[1] * query["miles_traveled"] + beta[2] * query["total_receipts_amount"]
-
-    # 2) Residual via kNN on residual set
-    dists = []
-    for inp, res in _RESIDUAL_SET:
-        dist = _squared_distance(query, inp)
-        dists.append((dist, res, inp))
-
+    # kNN residual prediction
+    dists = [(_squared_distance({"trip_duration_days": days, "miles_traveled": miles, "total_receipts_amount": receipts}, inp), res) for inp, res in _RIDGE_RES_LIST]
     dists.sort(key=lambda t: t[0])
-    top = dists[:K_NEIGHBOURS]
-
-    # Exact match shortcut
+    top = dists[:RES_K]
     if top and top[0][0] < _EPS:
-        # retrieve original expected output directly by baseline+res
-        return round(baseline + top[0][1], 2)
+        residual_pred = top[0][1]
+    else:
+        w = [1/(d+_EPS) for d,_ in top]
+        residual_pred = sum(wi*ri for wi,(_,ri) in zip(w,top)) / sum(w)
 
-    weights = [1.0 / (d + _EPS) for d, _, _ in top]
-    residual_pred = sum(w * r for w, (_, r, _) in zip(weights, top)) / sum(weights)
-
-    return round(baseline + residual_pred, 2)
+    return round(ridge_val + _alpha(receipts) * residual_pred, 2)
 
 def main(argv):
     if len(argv) != 4:
