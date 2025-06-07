@@ -103,6 +103,12 @@ def _features(days: float, miles: float, receipts: float):
     log_r = math.log1p(receipts)
 
     total_receipts_large = max(0.0, receipts - 1500.0)
+    is_five_day = 1.0 if days == 5 else 0.0
+    is_short = 1.0 if days <= 3 else 0.0
+    is_long = 1.0 if days >= 7 else 0.0
+    high_receipts_flag = 1.0 if receipts > 800 else 0.0
+    low_receipts_flag  = 1.0 if receipts < 50 else 0.0
+    rounding_flag = 1.0 if abs((receipts*100) % 100 - 49) < 1e-6 or abs((receipts*100) % 100 - 99) < 1e-6 else 0.0
     return [
         1.0,
         days,
@@ -114,12 +120,19 @@ def _features(days: float, miles: float, receipts: float):
         days * miles,
         days * receipts,
         miles * receipts,
-        rec_per_day,
-        rec_per_day * rec_per_day,
         miles_per_day,
+        rec_per_day,
         miles_per_day * miles_per_day,
-        log_r,
-        log_r * log_r,
+        rec_per_day * rec_per_day,
+        miles_per_day * rec_per_day,
+        is_five_day,
+        is_short,
+        is_long,
+        high_receipts_flag,
+        low_receipts_flag,
+        rounding_flag,
+        math.log1p(receipts),
+        is_long * max(0.0, rec_per_day - 150.0),
         high_receipt_pen,
         low_receipt_pen,
         high_receipt_pen * high_receipt_pen,
@@ -175,6 +188,29 @@ def _train_ridge():
 
 _train_ridge()
 
+# Build bias table for coarse residual correction
+def _cell(d, mpd, spd):
+    return (min(int(d), 9), int(mpd // 50), int(spd // 50))
+
+_BIAS_TABLE = {}
+_TABLE_COUNTS = {}
+for _c in _RAW_DATA:
+    d = _c["input"]["trip_duration_days"]
+    miles = _c["input"]["miles_traveled"]
+    receipts = _c["input"]["total_receipts_amount"]
+    mpd = miles / max(d,1e-6)
+    spd = receipts / max(d,1e-6)
+    cell = _cell(d, mpd, spd)
+    residual = _c["expected_output"] - sum(b*f for b,f in zip(_BETA, _features(d,miles,receipts)))
+    _BIAS_TABLE[cell] = _BIAS_TABLE.get(cell,0.0) + residual
+    _TABLE_COUNTS[cell] = _TABLE_COUNTS.get(cell,0) + 1
+
+for k in list(_BIAS_TABLE):
+    _BIAS_TABLE[k] /= _TABLE_COUNTS[k]
+
+# weight for bias table adjustment
+TABLE_ALPHA = 0.6
+
 # Build residual set relative to ridge baseline for kNN smoothing
 _RIDGE_RES_LIST = []  # list of (input_dict, residual)
 for _c in _RAW_DATA:
@@ -189,12 +225,12 @@ for _c in _RAW_DATA:
 # residual kNN weighting dynamically determined
 # Function will interpolate 0.3 (low receipts) to 0.8 (very high receipts)
 # Increase k to 9 for smoother residual estimate
-RES_K = 9
+RES_K = 9  # smoother residual
 
 def _alpha(receipts: float) -> float:
     """Return weight for residual adjustment based on receipts.
-    Low receipts use ~0.3 weight, high receipts (~2000) use ~0.8."""
-    return 0.3 + 0.5 / (1.0 + math.exp(-(receipts - 1200.0) / 400.0))
+    Low receipts use ~0.2 weight, high receipts (~2000) use ~0.5."""
+    return 0.2 + 0.3 / (1.0 + math.exp(-(receipts - 1200.0) / 400.0))
 
 # Public API
 def predict(trip_duration_days: float, miles_traveled: float, total_receipts_amount: float) -> float:
@@ -216,7 +252,21 @@ def predict(trip_duration_days: float, miles_traveled: float, total_receipts_amo
         w = [1/(d+_EPS) for d,_ in top]
         residual_pred = sum(wi*ri for wi,(_,ri) in zip(w,top)) / sum(w)
 
-    return round(ridge_val + _alpha(receipts) * residual_pred, 2)
+    # bias table adjustment
+    mpd = miles / max(days,1e-6)
+    spd = receipts / max(days,1e-6)
+    table_adj = _BIAS_TABLE.get(_cell(days, mpd, spd), 0.0)
+
+    base_val = ridge_val + _alpha(receipts) * residual_pred + TABLE_ALPHA * table_adj
+
+    # Floor adjustment for trips with very low receipts (legacy per-diem rule)
+    rec_per_day = receipts / max(days, 1e-6)
+    if rec_per_day < 50.0:
+        day_rate = 100.0 if days <= 5 else 80.0
+        floor_val = day_rate * days + 0.5 * miles
+        base_val = max(base_val, floor_val)
+
+    return round(base_val, 2)
 
 def main(argv):
     if len(argv) != 4:
